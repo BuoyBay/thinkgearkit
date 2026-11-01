@@ -1,0 +1,13 @@
+{
+  "schema": 1,
+  "name": "thinkgearkit",
+  "version": "0.1.0",
+  "description": "ThinkGear packet/Connector decoding, freshness and explicit native MindWave transports",
+  "libraries": [
+    {
+      "libName": "buoy_thinkgearkit",
+      "system": false,
+      "minVersion": "0.1.0"
+    }
+  ]
+}

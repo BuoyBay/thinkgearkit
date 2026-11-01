@@ -1,0 +1,1044 @@
+Private Declare Function TGOpenSerial Lib "buoy_thinkgearkit" Alias "tg_open_serial" (entryPath As String) As Integer
+Private Declare Function TGOpenTCP Lib "buoy_thinkgearkit" Alias "tg_open_tcp" (host As String, port As Integer) As Integer
+Private Declare Function TGOpenRFCOMM Lib "buoy_thinkgearkit" Alias "tg_open_rfcomm" (name As String) As Integer
+Private Declare Function TGOpenBLE Lib "buoy_thinkgearkit" Alias "tg_open_ble" (name As String) As Integer
+Private Declare Function TGReadByte Lib "buoy_thinkgearkit" Alias "tg_read_byte" (handle As Integer) As Integer
+Private Declare Function TGStatus Lib "buoy_thinkgearkit" Alias "tg_status" (handle As Integer) As Integer
+Private Declare Sub TGClose Lib "buoy_thinkgearkit" Alias "tg_close" (handle As Integer)
+Private Declare Function TGError Lib "buoy_thinkgearkit" Alias "tg_error" () As CString
+Private Declare Function TGDrainBLEEvent Lib "buoy_thinkgearkit" Alias "tg_drain_ble_event" (handle As Integer) As CString
+Private Declare Function TGMonotonicSeconds Lib "buoy_thinkgearkit" Alias "tg_monotonic_seconds" () As Double
+Private Declare Function TGBLEEventsDropped Lib "buoy_thinkgearkit" Alias "tg_ble_events_dropped" (handle As Integer) As Integer
+Private Declare Function TGDiscoverHeadsets Lib "buoy_thinkgearkit" Alias "tg_discover_headsets" () As CString
+
+''' Known OS inventory entry; enumeration neither opens nor pairs a device.
+Public Class ThinkGearKnownHeadset
+    Public Property Id As String = ""
+    Public Property Name As String = ""
+    Public Property Endpoint As String = ""
+    Public Property Transport As String = ""
+    Public Property PairingKnown As Boolean = False
+    Public Property Paired As Boolean = False
+End Class
+
+Public Class ThinkGearHeadsetInventory
+    Public Property Supported As Boolean = False
+    Public Property Complete As Boolean = False
+    Public Property Error As String = ""
+    Public Property Devices As Array Of ThinkGearKnownHeadset = []
+End Class
+
+''' Read existing paired macOS devices or named serial inventory, without radio discovery.
+Public Function DiscoverThinkGearHeadsets() As ThinkGearHeadsetInventory
+    Dim output As New ThinkGearHeadsetInventory()
+    Dim borrowed As CString = TGDiscoverHeadsets()
+    If borrowed = Nil Then
+        output.Error = "Native known-headset inventory returned no result"
+        Return output
+    End If
+    Dim inventoryText As String = CType(borrowed, String)
+    If Bytes.FromString(inventoryText, Text.Encodings.UTF8).Count > 1048576 Then
+        output.Error = "Native known-headset inventory exceeds the response byte bound"
+        Return output
+    End If
+    Dim parsed As Optional Of JSONItem = Json.TryParse(inventoryText)
+    If Not parsed.HasValue Then
+        output.Error = "Native known-headset inventory returned invalid JSON"
+        Return output
+    End If
+    Dim root As JSONItem = parsed.Value
+    If Not root.IsObject() Then
+        output.Error = "Native known-headset inventory is not an object"
+        Return output
+    End If
+    output.Supported = root.Value("supported").AsBoolean().Or(False)
+    output.Complete = root.Value("complete").AsBoolean().Or(False)
+    output.Error = root.Value("error").AsString().Or("")
+    Dim devices As JSONItem = root.Value("devices")
+    If Not devices.IsArray() Then
+        output.Complete = False
+        output.Error = "Native known-headset inventory lacks an array of devices"
+        Return output
+    End If
+    Dim count As Integer = devices.Count
+    If count > 64 Then
+        count = 64
+        output.Complete = False
+        output.Error = "Known-headset inventory exceeds the 64-entry bound"
+    End If
+    For i As Integer = 0 To count - 1
+        Dim item As JSONItem = devices.ValueAt(i)
+        Dim candidate As New ThinkGearKnownHeadset()
+        candidate.Id = item.Value("id").AsString().Or("")
+        candidate.Name = item.Value("name").AsString().Or("")
+        candidate.Endpoint = item.Value("endpoint").AsString().Or("")
+        candidate.Transport = item.Value("transport").AsString().Or("")
+        candidate.PairingKnown = item.Value("pairing_known").AsBoolean().Or(False)
+        candidate.Paired = item.Value("paired").AsBoolean().Or(False)
+        Dim valid As Boolean = candidate.Id <> "" And candidate.Endpoint <> ""
+        valid = valid And String.Len(candidate.Id) <= 4096 And String.Len(candidate.Name) <= 4096 And String.Len(candidate.Endpoint) <= 4096
+        valid = valid And (candidate.Transport = "rfcomm" Or candidate.Transport = "serial")
+        If candidate.Transport = "rfcomm" Then valid = valid And String.Left(candidate.Endpoint, 10) = "bluetooth:" And String.Len(candidate.Endpoint) > 10
+        If candidate.Transport = "serial" Then valid = valid And String.Left(candidate.Endpoint, 7) = "serial:" And String.Len(candidate.Endpoint) > 7
+        For Each previous As ThinkGearKnownHeadset In output.Devices
+            If previous.Endpoint = candidate.Endpoint Then valid = False
+        Next
+        If valid Then
+            Array.Append(output.Devices, candidate)
+        Else
+            output.Complete = False
+            If output.Error = "" Then output.Error = "Known-headset inventory contained an invalid or duplicate entry"
+        End If
+    Next
+    Return output
+End Function
+
+''' Original characteristic notifications, including rejected/unknown values.
+Public Class ThinkGearBLENotification
+    Public Property Sequence As Integer
+    Public Property Received As Double
+    Public Property NativeReceived As Double
+    Public Property ClockMapped As Boolean = False
+    Public Property CharacteristicUUID As String = ""
+    Public Property PayloadHex As String = ""
+    Public Property PayloadLength As Integer = 0
+    Public Property Accepted As Boolean = False
+    Public Property HadValue As Boolean = False
+    Public Property MetadataTruncated As Boolean = False
+    Public Property MetadataSanitized As Boolean = False
+    Public Property ValueMayBeCached As Boolean = False
+    Public Property Reason As String = ""
+    Public Property Integrity As String = "bluetooth_stack_no_payload_checksum"
+    Public Property ErrorDomain As String = ""
+    Public Property ErrorCode As Integer = 0
+    Public Property ErrorMessage As String = ""
+    Public Property IsOverflow As Boolean = False
+    Public Property DroppedCount As Integer = 0
+    Public Property DroppedBytes As Integer = 0
+    Public Property JSON As String = ""
+End Class
+
+Public Class ThinkGearRawEvent
+    Public Property Raw As Integer
+    Public Property Received As Double
+    Public Property PoorSignal As Integer
+    Public Property SignalAt As Double
+End Class
+
+''' Sparse telemetry; caller supplies a monotonic clock in seconds.
+Public Class ThinkGearState
+    Public Property Attention As Integer = -1
+    Public Property Meditation As Integer = -1
+    Public Property BatteryRaw As Integer = -1
+    Public Property BatteryAt As Double = -1.0
+    Public Property PoorSignal As Integer = -1
+    Public Property Delta As Integer = -1
+    Public Property Raw As Integer = 0
+    Public Property BlinkStrength As Integer = 0
+    Public Property BlinkCount As Integer = 0
+    Public Property RawCount As Integer = 0
+    Public Property AttentionAt As Double = -1.0
+    Public Property MeditationAt As Double = -1.0
+    Public Property SignalAt As Double = -1.0
+    Public Property DeltaAt As Double = -1.0
+    Public Property RawAt As Double = -1.0
+    Public Property BlinkAt As Double = -1.0
+    Public Property Simulated As Boolean = False
+    Public Property Connected As Boolean = False
+    Public Property BandAt As Array Of Double
+    Private Property mRawQueue As Array Of Integer
+    Private Property mRawEvents As Array Of ThinkGearRawEvent = []
+    Public Property DroppedRaw As Integer = 0
+    Public Property Bands As Array Of Integer
+
+    Public Sub Constructor()
+        Me.Bands = []
+        Me.BandAt = []
+        mRawQueue = []
+        For i As Integer = 0 To 7
+            Array.Append(Me.Bands, -1)
+            Array.Append(Me.BandAt, -1.0)
+        Next
+    End Sub
+
+    Public Sub Reset()
+        Attention = -1
+        Meditation = -1
+        BatteryRaw = -1
+        BatteryAt = -1.0
+        PoorSignal = -1
+        Delta = -1
+        Raw = 0
+        BlinkStrength = 0
+        BlinkCount = 0
+        RawCount = 0
+        AttentionAt = -1.0
+        MeditationAt = -1.0
+        SignalAt = -1.0
+        DeltaAt = -1.0
+        RawAt = -1.0
+        BlinkAt = -1.0
+        Simulated = False
+        Connected = False
+        mRawQueue = []
+        DroppedRaw = 0
+        mRawEvents = []
+        For i As Integer = 0 To 7
+            Bands(i) = -1
+            BandAt(i) = -1.0
+        Next
+    End Sub
+
+    Public Sub PushRaw(value As Integer, nowSeconds As Double)
+        Raw = value
+        RawAt = nowSeconds
+        RawCount += 1
+        If Array.Count(mRawQueue) >= 65536 Then
+            DroppedRaw += 1
+        Else
+            Array.Append(mRawQueue, value)
+            Dim rawEvent As New ThinkGearRawEvent()
+            rawEvent.Raw = value
+            rawEvent.Received = nowSeconds
+            rawEvent.PoorSignal = PoorSignal
+            rawEvent.SignalAt = SignalAt
+            Array.Append(mRawEvents, rawEvent)
+        End If
+    End Sub
+
+    Public Function DrainRaw() As Array Of Integer
+        Dim output As Array Of Integer = mRawQueue
+        mRawQueue = []
+        mRawEvents = []
+        Return output
+    End Function
+
+    Public Function DrainRawEvents() As Array Of ThinkGearRawEvent
+        Dim output As Array Of ThinkGearRawEvent = mRawEvents
+        mRawQueue = []
+        mRawEvents = []
+        Return output
+    End Function
+
+    Public Function Usable(nowSeconds As Double, useMeditation As Boolean = False, freshness As Double = 3.0) As Boolean
+        If Not Connected Then Return False
+        If PoorSignal <> 0 Or SignalAt < 0.0 Or nowSeconds < SignalAt Or nowSeconds - SignalAt > freshness Then Return False
+        If useMeditation Then Return Meditation > 0 And MeditationAt >= 0.0 And nowSeconds >= MeditationAt And nowSeconds - MeditationAt <= freshness
+        Return Attention > 0 And AttentionAt >= 0.0 And nowSeconds >= AttentionAt And nowSeconds - AttentionAt <= freshness
+    End Function
+
+    Public Sub SetSimulated(attentionValue As Integer, meditationValue As Integer, nowSeconds As Double)
+        If attentionValue < 0 Or attentionValue > 100 Or meditationValue < 0 Or meditationValue > 100 Then Throw New InvalidArgumentException("Scores must be in 0..100")
+        Simulated = True
+        Connected = True
+        Attention = attentionValue
+        Meditation = meditationValue
+        PoorSignal = 0
+        AttentionAt = nowSeconds
+        MeditationAt = nowSeconds
+        SignalAt = nowSeconds
+    End Sub
+End Class
+
+Public Class ThinkGearPacket
+    Public Property Received As Double
+    Public Property PayloadHex As String = ""
+    Public Property Rows As String = ""
+    Public Property Malformed As Boolean = False
+    Public Property Protocol As String = "thinkgear"
+End Class
+
+Private Function TGHex(value As Integer) As String
+    Dim digits As String = "0123456789abcdef"
+    Return String.Substring(digits, value \ 16, 1) + String.Substring(digits, value Mod 16, 1)
+End Function
+
+''' One decoded sparse update with an owned cached snapshot and presence flags.
+Public Class ThinkGearTelemetryEvent
+    Public Property Received As Double
+    Public Property Attention As Integer = -1
+    Public Property Meditation As Integer = -1
+    Public Property BatteryRaw As Integer = -1
+    Public Property BatteryAt As Double = -1.0
+    Public Property ChangedBattery As Boolean = False
+    Public Property PoorSignal As Integer = -1
+    Public Property AttentionAt As Double = -1.0
+    Public Property MeditationAt As Double = -1.0
+    Public Property SignalAt As Double = -1.0
+    Public Property Bands As Array Of Integer = []
+    Public Property ChangedBands As Array Of Boolean = []
+    Public Property ChangedAttention As Boolean = False
+    Public Property ChangedMeditation As Boolean = False
+    Public Property ChangedSignal As Boolean = False
+    Public Property Raw As Integer = 0
+    Public Property HasRaw As Boolean = False
+    Public Property BlinkStrength As Integer = 0
+    Public Property ChangedBlink As Boolean = False
+
+    Public Sub Constructor()
+        For i As Integer = 0 To 7
+            Bands.Append(-1)
+            ChangedBands.Append(False)
+        Next
+    End Sub
+End Class
+
+''' Incremental ThinkGear binary framing and bounded Connector JSON lines.
+Public Class ThinkGearDecoder
+    Private Property mState As ThinkGearState
+    Private Property mBuffer As Array Of Integer
+    Private Property mLine As String = ""
+    Private Property mDiscardLine As Boolean = False
+    Public Property Packets As Integer = 0
+    Public Property ChecksumErrors As Integer = 0
+    Public Property MalformedPayloads As Integer = 0
+    Public Property DroppedPacketEvents As Integer = 0
+    Private Property mPacketQueue As Array Of String = []
+    Private Property mEvents As Array Of ThinkGearPacket = []
+    Private Property mTelemetry As Array Of ThinkGearTelemetryEvent = []
+    Public Property DroppedTelemetryEvents As Integer = 0
+
+    Public Function DrainTelemetryEvents() As Array Of ThinkGearTelemetryEvent
+        Dim output As Array Of ThinkGearTelemetryEvent = mTelemetry
+        mTelemetry = []
+        Return output
+    End Function
+
+    Private Sub CommitTelemetry(update As ThinkGearTelemetryEvent, nowSeconds As Double)
+        Dim hasUpdate As Boolean = update.ChangedAttention Or update.ChangedMeditation Or update.ChangedSignal Or update.HasRaw Or update.ChangedBlink Or update.ChangedBattery
+        For i As Integer = 0 To 7
+            If update.ChangedBands(i) Then hasUpdate = True
+        Next
+        If Not hasUpdate Then Exit Sub
+        If Array.Count(mTelemetry) >= 65536 Then
+            DroppedTelemetryEvents += 1
+            Exit Sub
+        End If
+        update.Received = nowSeconds
+        update.Attention = mState.Attention
+        update.Meditation = mState.Meditation
+        update.BatteryRaw = mState.BatteryRaw
+        update.BatteryAt = mState.BatteryAt
+        update.PoorSignal = mState.PoorSignal
+        update.AttentionAt = mState.AttentionAt
+        update.MeditationAt = mState.MeditationAt
+        update.SignalAt = mState.SignalAt
+        For i As Integer = 0 To 7
+            update.Bands(i) = mState.Bands(i)
+        Next
+        If update.HasRaw Then update.Raw = mState.Raw
+        If update.ChangedBlink Then update.BlinkStrength = mState.BlinkStrength
+        mTelemetry.Append(update)
+    End Sub
+
+    Public Function DrainPacketEvents() As Array Of ThinkGearPacket
+        Dim output As Array Of ThinkGearPacket = mEvents
+        mEvents = []
+        mPacketQueue = []
+        Return output
+    End Function
+
+    Public Function DrainPackets() As Array Of String
+        Dim output As Array Of String = mPacketQueue
+        mPacketQueue = []
+        mEvents = []
+        Return output
+    End Function
+
+    Public Sub Constructor(state As ThinkGearState)
+        If state Is Nil Then Throw New InvalidArgumentException("State is required")
+        mState = state
+        mBuffer = []
+    End Sub
+
+    Private Sub Drop(count As Integer)
+        Dim nextBuffer As Array Of Integer = []
+        For i As Integer = count To Array.Count(mBuffer) - 1
+            Array.Append(nextBuffer, mBuffer(i))
+        Next
+        mBuffer = nextBuffer
+    End Sub
+
+    Public Sub FeedByte(value As Integer, nowSeconds As Double)
+        If value < 0 Or value > 255 Then Throw New InvalidArgumentException("Byte must be in 0..255")
+        Array.Append(mBuffer, value)
+        While Array.Count(mBuffer) >= 3
+            If mBuffer(0) <> 170 Or mBuffer(1) <> 170 Or mBuffer(2) > 169 Then
+                Me.Drop(1)
+                Continue While
+            End If
+            Dim length As Integer = mBuffer(2)
+            If Array.Count(mBuffer) < length + 4 Then Exit While
+            Dim sum As Integer = 0
+            For i As Integer = 3 To length + 2
+                sum = (sum + mBuffer(i)) Mod 256
+            Next
+            If 255 - sum <> mBuffer(length + 3) Then
+                ChecksumErrors += 1
+                Me.Drop(1)
+                Continue While
+            End If
+            Packets += 1
+            If Array.Count(mPacketQueue) < 1024 Then
+                Dim payloadText As String = ""
+                For i As Integer = 3 To length + 2
+                    If i > 3 Then payloadText += " "
+                    payloadText += String.From(mBuffer(i))
+                Next
+                Array.Append(mPacketQueue, payloadText)
+            End If
+            Dim packetEvent As New ThinkGearPacket()
+            packetEvent.Received = nowSeconds
+            packetEvent.Malformed = Not Me.ValidRows(length)
+            packetEvent.Rows = Me.RowsJSON(length)
+            For i As Integer = 3 To length + 2
+                packetEvent.PayloadHex += TGHex(mBuffer(i))
+            Next
+            If Array.Count(mEvents) < 1024 Then
+                Array.Append(mEvents, packetEvent)
+            Else
+                DroppedPacketEvents += 1
+            End If
+            If Not packetEvent.Malformed Then
+                Me.ApplyRows(length, nowSeconds)
+            Else
+                MalformedPayloads += 1
+            End If
+            Me.Drop(length + 4)
+        End While
+    End Sub
+
+    Private Function ValidRows(length As Integer) As Boolean
+        Dim pos As Integer = 3
+        Dim finish As Integer = length + 3
+        While pos < finish
+            While pos < finish And mBuffer(pos) = 85
+                pos += 1
+            End While
+            If pos >= finish Then Return False
+            Dim code As Integer = mBuffer(pos)
+            pos += 1
+            Dim size As Integer = 1
+            If code >= 128 Then
+                If pos >= finish Then Return False
+                size = mBuffer(pos)
+                pos += 1
+            End If
+            If size > finish - pos Then Return False
+            pos += size
+        End While
+        Return True
+    End Function
+
+    Private Function RowsJSON(length As Integer) As String
+        Dim output As String = "["
+        Dim pos As Integer = 3
+        Dim finish As Integer = length + 3
+        While pos < finish
+            Dim extended As Integer = 0
+            While pos < finish And mBuffer(pos) = 85
+                extended += 1
+                pos += 1
+            End While
+            If pos >= finish Then Exit While
+            Dim code As Integer = mBuffer(pos)
+            pos += 1
+            Dim size As Integer = 1
+            If code >= 128 Then
+                If pos >= finish Then Exit While
+                size = mBuffer(pos)
+                pos += 1
+            End If
+            If size > finish - pos Then Exit While
+            Dim hex As String = ""
+            For i As Integer = pos To pos + size - 1
+                hex += TGHex(mBuffer(i))
+            Next
+            If String.Len(output) > 1 Then output += ","
+            output += "{\"code\":" + String.From(code) + ",\"extended\":" + String.From(extended) + ",\"hex\":\"" + hex + "\"}"
+            pos += size
+        End While
+        Return output + "]"
+    End Function
+
+    Private Sub ApplyRows(length As Integer, nowSeconds As Double)
+        Dim update As New ThinkGearTelemetryEvent()
+        Dim pos As Integer = 3
+        Dim finish As Integer = length + 3
+        While pos < finish
+            Dim extended As Boolean = False
+            While pos < finish And mBuffer(pos) = 85
+                extended = True
+                pos += 1
+            End While
+            Dim code As Integer = mBuffer(pos)
+            pos += 1
+            Dim size As Integer = 1
+            If code >= 128 Then
+                size = mBuffer(pos)
+                pos += 1
+            End If
+            If Not extended Then
+                If code = 1 And size = 1 Then
+                    update.ChangedBattery = True
+                    mState.BatteryRaw = mBuffer(pos)
+                    mState.BatteryAt = nowSeconds
+                ElseIf code = 2 And size = 1 Then
+                    update.ChangedSignal = True
+                    mState.PoorSignal = mBuffer(pos)
+                    mState.SignalAt = nowSeconds
+                ElseIf code = 4 And size = 1 And mBuffer(pos) <= 100 Then
+                    update.ChangedAttention = True
+                    mState.Attention = mBuffer(pos)
+                    mState.AttentionAt = nowSeconds
+                ElseIf code = 5 And size = 1 And mBuffer(pos) <= 100 Then
+                    update.ChangedMeditation = True
+                    mState.Meditation = mBuffer(pos)
+                    mState.MeditationAt = nowSeconds
+                ElseIf code = 22 And size = 1 Then
+                    update.ChangedBlink = True
+                    mState.BlinkStrength = mBuffer(pos)
+                    mState.BlinkAt = nowSeconds
+                    If mState.BlinkStrength > 0 Then mState.BlinkCount += 1
+                ElseIf code = 128 And size = 2 Then
+                    update.HasRaw = True
+                    mState.Raw = mBuffer(pos) * 256 + mBuffer(pos + 1)
+                    If mState.Raw >= 32768 Then mState.Raw -= 65536
+                    mState.PushRaw(mState.Raw, nowSeconds)
+                ElseIf code = 131 And size = 24 Then
+                    For band As Integer = 0 To 7
+                        update.ChangedBands(band) = True
+                        Dim offset As Integer = pos + band * 3
+                        mState.Bands(band) = mBuffer(offset) * 65536 + mBuffer(offset + 1) * 256 + mBuffer(offset + 2)
+                        mState.BandAt(band) = nowSeconds
+                    Next
+                    mState.Delta = mState.Bands(0)
+                    mState.DeltaAt = nowSeconds
+                End If
+            End If
+            pos += size
+        End While
+        Me.CommitTelemetry(update, nowSeconds)
+    End Sub
+
+    Public Sub FeedJSONByte(value As Integer, nowSeconds As Double)
+        If value < 0 Or value > 255 Then Throw New InvalidArgumentException("Byte must be in 0..255")
+        If value = 10 Or value = 13 Then
+            If Not mDiscardLine And mLine <> "" Then Me.FeedJSON(mLine, nowSeconds)
+            mLine = ""
+            mDiscardLine = False
+        ElseIf Not mDiscardLine Then
+            If String.Len(mLine) >= 65536 Then
+                mLine = ""
+                mDiscardLine = True
+            ElseIf value < 128 Then
+                mLine += String.Chr(value)
+            Else
+                mDiscardLine = True
+            End If
+        End If
+    End Sub
+
+    Public Sub FeedJSON(line As String, nowSeconds As Double)
+        Dim parsed As Optional Of JSONItem = Json.TryParse(line)
+        If Not parsed.HasValue Then
+            MalformedPayloads += 1
+            Exit Sub
+        End If
+        Dim item As JSONItem = parsed.Value
+        If Not item.IsObject() Then
+            MalformedPayloads += 1
+            Exit Sub
+        End If
+        Dim update As New ThinkGearTelemetryEvent()
+        Dim signal As Integer = Me.JSONNumber(item, "poorSignalLevel", 0, 255)
+        If signal >= 0 Then
+            update.ChangedSignal = True
+            mState.PoorSignal = signal
+            mState.SignalAt = nowSeconds
+        End If
+        Dim sense As JSONItem = item.Value("eSense")
+        If sense.IsObject() Then
+            Dim attention As Integer = Me.JSONNumber(sense, "attention", 0, 100)
+            Dim meditation As Integer = Me.JSONNumber(sense, "meditation", 0, 100)
+            If attention >= 0 Then
+                update.ChangedAttention = True
+                mState.Attention = attention
+                mState.AttentionAt = nowSeconds
+            End If
+            If meditation >= 0 Then
+                update.ChangedMeditation = True
+                mState.Meditation = meditation
+                mState.MeditationAt = nowSeconds
+            End If
+        End If
+        Dim raw As Integer = Me.JSONNumber(item, "rawEeg", -32768, 32767)
+        If item.HasKey("rawEeg") And raw >= -32768 Then
+            Dim rawField As JSONItem = item.Value("rawEeg")
+            If rawField.IsNumber() Then
+                Dim n As Double = rawField.AsNumber().Value
+                If n >= -32768.0 And n <= 32767.0 And n = Math.Floor(n) Then
+                    update.HasRaw = True
+                    mState.PushRaw(n, nowSeconds)
+                End If
+            End If
+        End If
+        Dim blink As Integer = Me.JSONNumber(item, "blinkStrength", 1, 255)
+        If blink > 0 Then
+            update.ChangedBlink = True
+            mState.BlinkStrength = blink
+            mState.BlinkAt = nowSeconds
+            mState.BlinkCount += 1
+        End If
+        Dim power As JSONItem = item.Value("eegPower")
+        If Not power.IsObject() And sense.IsObject() Then power = sense.Value("eegPower")
+        If power.IsObject() Then
+            Dim names As Array Of String = ["delta", "theta", "lowAlpha", "highAlpha", "lowBeta", "highBeta", "lowGamma", "highGamma"]
+            For i As Integer = 0 To 7
+                Dim n As Integer = Me.JSONNumber(power, names(i), 0, 4294967295)
+                If n >= 0 Then
+                    update.ChangedBands(i) = True
+                    mState.Bands(i) = n
+                    mState.BandAt(i) = nowSeconds
+                    If i = 0 Then
+                        mState.Delta = n
+                        mState.DeltaAt = nowSeconds
+                    End If
+                End If
+            Next
+        End If
+        Me.CommitTelemetry(update, nowSeconds)
+        Packets += 1
+        If Array.Count(mPacketQueue) < 1024 Then Array.Append(mPacketQueue, line)
+        If Array.Count(mEvents) < 1024 Then
+            Dim packetEvent As New ThinkGearPacket()
+            packetEvent.Received = nowSeconds
+            packetEvent.Protocol = "json"
+            packetEvent.Rows = line
+            Array.Append(mEvents, packetEvent)
+        Else
+            DroppedPacketEvents += 1
+        End If
+    End Sub
+
+    Private Function JSONNumber(item As JSONItem, key As String, minimum As Integer, maximum As Integer) As Integer
+        Dim field As JSONItem = item.Value(key)
+        If Not field.IsNumber() Then Return -1
+        Dim value As Double = field.AsNumber().Value
+        If value <> value Or value < minimum Or value > maximum Or value <> Math.Floor(value) Then Return -1
+        Return value
+    End Function
+End Class
+
+''' Explicit single-owner transport; poll from a GUI timer, close before replacing.
+Public Class ThinkGearConnection
+    Private Property mState As ThinkGearState
+    Private Property mDecoder As ThinkGearDecoder
+    Private Property mHandle As Integer = 0
+    Private Property mJSON As Boolean = False
+    Public Property LastError As String = ""
+    Private Property mTransportHex As String = ""
+    Private Property mMode As String = ""
+    Private Property mEndpoint As String = ""
+    Private Property mPort As Integer = 13854
+    Private Property mRetryAt As Double = -1.0
+    Private Property mSilentAt As Double = -1.0
+    Public Property AutoReconnect As Boolean = True
+    Public Property DesiredConnection As Boolean = False
+    Public Property Reconnects As Integer = 0
+    Public Property LastByteAt As Double = -1.0
+    Private Property mLastPollNow As Double = 0.0
+    Private Property mPendingRaw As Array Of ThinkGearRawEvent = []
+    Private Property mPendingPackets As Array Of ThinkGearPacket = []
+    Private Property mPriorDroppedRaw As Integer = 0
+    Public Property CloseReadBudgetExhaustions As Integer = 0
+
+    Public Property DroppedRawEvents As Integer
+        Get
+            Return mPriorDroppedRaw + mState.DroppedRaw
+        End Get
+    End Property
+
+    Private Sub RetireRaw()
+        mPriorDroppedRaw += mState.DroppedRaw
+        For Each rawEvent As ThinkGearRawEvent In mState.DrainRawEvents()
+            If Array.Count(mPendingRaw) < 65536 Then
+                Array.Append(mPendingRaw, rawEvent)
+            Else
+                mPriorDroppedRaw += 1
+            End If
+        Next
+    End Sub
+
+    Private Sub DrainNativeBeforeClose()
+        If mHandle = 0 Then Exit Sub
+        Dim readCount As Integer = 0
+        While readCount < 262144
+            Dim value As Integer = TGReadByte(mHandle)
+            If value < 0 Then Exit While
+            If String.Len(mTransportHex) < 131072 Then mTransportHex += TGHex(value)
+            If mJSON Then
+                mDecoder.FeedJSONByte(value, mLastPollNow)
+            Else
+                mDecoder.FeedByte(value, mLastPollNow)
+            End If
+            readCount += 1
+        End While
+        If readCount = 262144 Then CloseReadBudgetExhaustions += 1
+        Me.CaptureBLEBeforeClose()
+    End Sub
+    Private Property mPriorPackets As Integer = 0
+    Private Property mPriorChecksumErrors As Integer = 0
+    Private Property mPriorMalformedPayloads As Integer = 0
+    Private Property mPriorDroppedPacketEvents As Integer = 0
+    Private Property mPriorDroppedTelemetry As Integer = 0
+    Private Property mPendingTelemetry As Array Of ThinkGearTelemetryEvent = []
+
+    Public Property Packets As Integer
+        Get
+            Return mPriorPackets + mDecoder.Packets
+        End Get
+    End Property
+
+    Public Property ChecksumErrors As Integer
+        Get
+            Return mPriorChecksumErrors + mDecoder.ChecksumErrors
+        End Get
+    End Property
+
+    Public Property MalformedPayloads As Integer
+        Get
+            Return mPriorMalformedPayloads + mDecoder.MalformedPayloads
+        End Get
+    End Property
+
+    Public Property DroppedTelemetryEvents As Integer
+        Get
+            Return mPriorDroppedTelemetry + mDecoder.DroppedTelemetryEvents
+        End Get
+    End Property
+
+    Public Property DroppedPacketEvents As Integer
+        Get
+            Return mPriorDroppedPacketEvents + mDecoder.DroppedPacketEvents
+        End Get
+    End Property
+
+    Public Function DrainTelemetryEvents() As Array Of ThinkGearTelemetryEvent
+        Dim output As Array Of ThinkGearTelemetryEvent = mPendingTelemetry
+        For Each sample As ThinkGearTelemetryEvent In mDecoder.DrainTelemetryEvents()
+            Array.Append(output, sample)
+        Next
+        mPendingTelemetry = []
+        Return output
+    End Function
+
+    Private Sub RetireDecoder()
+        mPriorPackets += mDecoder.Packets
+        mPriorChecksumErrors += mDecoder.ChecksumErrors
+        mPriorMalformedPayloads += mDecoder.MalformedPayloads
+        mPriorDroppedPacketEvents += mDecoder.DroppedPacketEvents
+        mPriorDroppedTelemetry += mDecoder.DroppedTelemetryEvents
+        For Each sample As ThinkGearTelemetryEvent In mDecoder.DrainTelemetryEvents()
+            If Array.Count(mPendingTelemetry) < 65536 Then
+                Array.Append(mPendingTelemetry, sample)
+            Else
+                mPriorDroppedTelemetry += 1
+            End If
+        Next
+        For Each packet As ThinkGearPacket In mDecoder.DrainPacketEvents()
+            If Array.Count(mPendingPackets) < 1024 Then
+                Array.Append(mPendingPackets, packet)
+            Else
+                mPriorDroppedPacketEvents += 1
+            End If
+        Next
+    End Sub
+    Private Property mBLENotifications As Array Of ThinkGearBLENotification = []
+    Private Property mBLEQueueBytes As Integer = 0
+    Private Property mBLEOverflow As ThinkGearBLENotification
+    Private Property mClockOffset As Double = 0.0
+    Private Property mClockMapped As Boolean = False
+    Private Property mNativeDropSeen As Integer = 0
+    Public Property DroppedBLENotifications As Integer = 0
+
+    Public Function DrainBLENotifications() As Array Of ThinkGearBLENotification
+        Me.CaptureBLEBeforeClose()
+        Dim output As Array Of ThinkGearBLENotification = mBLENotifications
+        If Not (mBLEOverflow Is Nil) Then Array.Append(output, mBLEOverflow)
+        mBLENotifications = []
+        mBLEQueueBytes = 0
+        mBLEOverflow = Nil
+        Return output
+    End Function
+
+    Private Function BLENumber(item As JSONItem, key As String) As Double
+        Return item.Value(key).AsNumber().Or(0.0)
+    End Function
+
+    Private Sub CaptureBLENotifications(nowSeconds As Double, mapClock As Boolean = True)
+        If mMode <> "ble" Or mHandle = 0 Then Exit Sub
+        Dim nativeNow As Double = TGMonotonicSeconds()
+        If Not mClockMapped And mapClock Then
+            mClockOffset = nowSeconds - nativeNow
+            mClockMapped = True
+        End If
+        Dim copied As Integer = 0
+        While copied < 8192
+            Dim borrowed As CString = TGDrainBLEEvent(mHandle)
+            If borrowed = Nil Then Exit While
+            Dim encoded As String = CType(borrowed, String)
+            Dim encodedBytes As Integer = Bytes.FromString(encoded, Text.Encodings.UTF8).Count
+            Dim parsed As Optional Of JSONItem = Json.TryParse(encoded)
+            If Not parsed.HasValue Then Throw New RuntimeException("Native BLE event returned invalid JSON")
+            Dim item As JSONItem = parsed.Value
+            Dim captured As New ThinkGearBLENotification()
+            captured.JSON = encoded
+            captured.Sequence = Me.BLENumber(item, "seq")
+            captured.NativeReceived = Me.BLENumber(item, "monotonic_seconds")
+            captured.ClockMapped = mClockMapped
+            captured.Received = -1.0
+            If mClockMapped Then captured.Received = captured.NativeReceived + mClockOffset
+            captured.CharacteristicUUID = item.Value("uuid").AsString().Or("")
+            captured.PayloadHex = item.Value("bytes_hex").AsString().Or("")
+            captured.PayloadLength = Me.BLENumber(item, "length")
+            captured.Accepted = item.Value("accepted").AsBoolean().Or(False)
+            captured.HadValue = item.Value("had_value").AsBoolean().Or(False)
+            captured.MetadataTruncated = item.Value("metadata_truncated").AsBoolean().Or(False)
+            captured.MetadataSanitized = item.Value("metadata_sanitized").AsBoolean().Or(False)
+            captured.ValueMayBeCached = item.Value("value_may_be_cached").AsBoolean().Or(False)
+            captured.Reason = item.Value("reason").AsString().Or("")
+            captured.Integrity = item.Value("integrity").AsString().Or("bluetooth_stack_no_payload_checksum")
+            captured.IsOverflow = item.Value("event_type").AsString().Or("") = "overflow"
+            captured.DroppedCount = Me.BLENumber(item, "dropped_count")
+            captured.DroppedBytes = Me.BLENumber(item, "dropped_bytes")
+            Dim nativeError As JSONItem = item.Value("error")
+            If nativeError.IsObject() Then
+                captured.ErrorDomain = nativeError.Value("domain").AsString().Or("")
+                captured.ErrorCode = Me.BLENumber(nativeError, "code")
+                captured.ErrorMessage = nativeError.Value("message").AsString().Or("")
+            End If
+            If Array.Count(mBLENotifications) < 8192 And mBLEQueueBytes + encodedBytes <= 8388608 And mBLEOverflow Is Nil Then
+                Array.Append(mBLENotifications, captured)
+                mBLEQueueBytes += encodedBytes
+            Else
+                DesiredConnection = False
+                If mBLEOverflow Is Nil Then
+                    mBLEOverflow = New ThinkGearBLENotification()
+                    mBLEOverflow.IsOverflow = True
+                    mBLEOverflow.Sequence = captured.Sequence
+                    mBLEOverflow.Received = captured.Received
+                    mBLEOverflow.NativeReceived = captured.NativeReceived
+                    mBLEOverflow.Reason = "buoy_recording_queue_overflow"
+                    LastError = "BLE recording queue overflow; drain notifications every frame"
+                End If
+                If captured.IsOverflow Then
+                    mBLEOverflow.DroppedCount += captured.DroppedCount
+                    mBLEOverflow.DroppedBytes += captured.DroppedBytes
+                Else
+                    mBLEOverflow.DroppedCount += 1
+                    mBLEOverflow.DroppedBytes += captured.PayloadLength
+                    DroppedBLENotifications += 1
+                End If
+            End If
+            copied += 1
+        End While
+        Dim nativeDropped As Integer = TGBLEEventsDropped(mHandle)
+        If nativeDropped > mNativeDropSeen Then DroppedBLENotifications += nativeDropped - mNativeDropSeen
+        mNativeDropSeen = nativeDropped
+    End Sub
+
+    Private Sub CaptureBLEBeforeClose()
+        If mMode <> "ble" Or mHandle = 0 Then Exit Sub
+        Me.CaptureBLENotifications(0.0, False)
+    End Sub
+
+    Public Sub Constructor(state As ThinkGearState)
+        If state Is Nil Then Throw New InvalidArgumentException("State is required")
+        mState = state
+        mDecoder = New ThinkGearDecoder(state)
+    End Sub
+
+    Public Property IsOpen As Boolean
+        Get
+            Return mHandle > 0 And TGStatus(mHandle) > 0
+        End Get
+    End Property
+
+    Public Function OpenSerial(entryPath As String) As Boolean
+        Me.Close()
+        mMode = "serial"
+        mEndpoint = entryPath
+        DesiredConnection = True
+        mHandle = TGOpenSerial(entryPath)
+        Return Me.Opened(False)
+    End Function
+
+    Public Function OpenTCP(host As String, port As Integer = 13854) As Boolean
+        Me.Close()
+        mMode = "tcp"
+        mEndpoint = host
+        mPort = port
+        DesiredConnection = True
+        mHandle = TGOpenTCP(host, port)
+        Return Me.Opened(True)
+    End Function
+
+    Public Function OpenMindWave(name As String = "MindWave") As Boolean
+        Me.Close()
+        mMode = "rfcomm"
+        mEndpoint = name
+        DesiredConnection = True
+        mHandle = TGOpenRFCOMM(name)
+        Return Me.Opened(False)
+    End Function
+
+    Public Function OpenBLE(name As String = "MindWave") As Boolean
+        Me.Close()
+        mMode = "ble"
+        mEndpoint = name
+        DesiredConnection = True
+        mHandle = TGOpenBLE(name)
+        Return Me.Opened(True)
+    End Function
+
+    Public Function DrainRaw() As Array Of Integer
+        Dim output As Array Of Integer = []
+        For Each captured As ThinkGearRawEvent In Me.DrainRawEvents()
+            Array.Append(output, captured.Raw)
+        Next
+        Return output
+    End Function
+
+    Public Function DrainRawEvents() As Array Of ThinkGearRawEvent
+        Dim output As Array Of ThinkGearRawEvent = mPendingRaw
+        For Each captured As ThinkGearRawEvent In mState.DrainRawEvents()
+            Array.Append(output, captured)
+        Next
+        mPendingRaw = []
+        Return output
+    End Function
+
+    Public Function DrainPackets() As Array Of String
+        Return mDecoder.DrainPackets()
+    End Function
+
+    Public Function DrainPacketEvents() As Array Of ThinkGearPacket
+        Dim output As Array Of ThinkGearPacket = mPendingPackets
+        For Each packet As ThinkGearPacket In mDecoder.DrainPacketEvents()
+            Array.Append(output, packet)
+        Next
+        mPendingPackets = []
+        Return output
+    End Function
+
+    Public Function DrainTransportHex() As String
+        Dim output As String = mTransportHex
+        mTransportHex = ""
+        Return output
+    End Function
+
+    Private Function Opened(jsonMode As Boolean) As Boolean
+        mJSON = jsonMode
+        mNativeDropSeen = 0
+        mClockMapped = False
+        If mHandle = 0 Then
+            LastError = CType(TGError(), String)
+            Return False
+        End If
+        LastError = ""
+        mState.Connected = TGStatus(mHandle) = 2
+        Return True
+    End Function
+
+    Public Function Poll(nowSeconds As Double, maxBytes As Integer = 16384) As Integer
+        If maxBytes < 1 Or maxBytes > 65536 Then Throw New InvalidArgumentException("Poll budget must be in 1..65536")
+        mLastPollNow = nowSeconds
+        If mHandle = 0 Then
+            If Not DesiredConnection Or Not AutoReconnect Then Return 0
+            If mRetryAt < 0.0 Then mRetryAt = nowSeconds + 2.0
+            If nowSeconds < mRetryAt Then Return 0
+            Me.RetireRaw()
+            mState.Reset()
+            Me.RetireDecoder()
+            mDecoder = New ThinkGearDecoder(mState)
+            If mMode = "serial" Then
+                mHandle = TGOpenSerial(mEndpoint)
+            ElseIf mMode = "tcp" Then
+                mHandle = TGOpenTCP(mEndpoint, mPort)
+            ElseIf mMode = "rfcomm" Then
+                mHandle = TGOpenRFCOMM(mEndpoint)
+            ElseIf mMode = "ble" Then
+                mHandle = TGOpenBLE(mEndpoint)
+            End If
+            Reconnects += 1
+            mNativeDropSeen = 0
+            mClockMapped = False
+            mRetryAt = nowSeconds + 2.0
+            mSilentAt = -1.0
+            If mHandle = 0 Then
+                LastError = CType(TGError(), String)
+                Return 0
+            End If
+            mState.Connected = TGStatus(mHandle) = 2
+        End If
+        Me.CaptureBLENotifications(nowSeconds)
+        If mSilentAt < 0.0 And TGStatus(mHandle) = 2 Then mSilentAt = nowSeconds
+        If mSilentAt >= 0.0 And nowSeconds - mSilentAt > 8.0 And AutoReconnect Then
+            Me.DrainNativeBeforeClose()
+            Me.CaptureBLENotifications(nowSeconds)
+            TGClose(mHandle)
+            mHandle = 0
+            mState.Connected = False
+            LastError = "Headset stream silent for eight seconds; reconnecting"
+            mRetryAt = nowSeconds + 2.0
+            Return 0
+        End If
+        Dim count As Integer = 0
+        While count < maxBytes
+            Dim value As Integer = TGReadByte(mHandle)
+            If value = -1 Then Exit While
+            If value < -1 Then
+                LastError = CType(TGError(), String)
+                Me.CaptureBLENotifications(nowSeconds)
+                TGClose(mHandle)
+                mHandle = 0
+                mState.Connected = False
+                mRetryAt = nowSeconds + 2.0
+                Exit While
+            End If
+            LastByteAt = nowSeconds
+            mSilentAt = nowSeconds
+            If String.Len(mTransportHex) < 131072 Then mTransportHex += TGHex(value)
+            If mJSON Then
+                mDecoder.FeedJSONByte(value, nowSeconds)
+            Else
+                mDecoder.FeedByte(value, nowSeconds)
+            End If
+            count += 1
+        End While
+        If mHandle > 0 Then Me.CaptureBLENotifications(nowSeconds)
+        If Not (mBLEOverflow Is Nil) And mHandle > 0 Then
+            Me.DrainNativeBeforeClose()
+            TGClose(mHandle)
+            mHandle = 0
+            mState.Connected = False
+        End If
+        Return count
+    End Function
+
+    Public Sub Close()
+        DesiredConnection = False
+        mRetryAt = -1.0
+        mSilentAt = -1.0
+        LastByteAt = -1.0
+        Me.DrainNativeBeforeClose()
+        Me.CaptureBLEBeforeClose()
+        If mHandle > 0 Then TGClose(mHandle)
+        mHandle = 0
+        Me.RetireRaw()
+        mState.Reset()
+        Me.RetireDecoder()
+        mDecoder = New ThinkGearDecoder(mState)
+    End Sub
+End Class

@@ -1,0 +1,68 @@
+Import thinkgearkit
+
+Sub Main(args As Array Of String)
+    If Array.Count(args) < 2 Then
+        Print "Usage: mindwave-probe serial DEVICE [SECONDS] | tcp HOST [SECONDS] [PORT] | native [NAME] [SECONDS] | ble [NAME] [SECONDS]"
+        Print "No transport opened. Pair/bind the headset using OS settings first."
+        Exit Sub
+    End If
+    Dim mode As String = args(1)
+    Dim endpoint As String = "MindWave"
+    If Array.Count(args) > 2 Then endpoint = args(2)
+    Dim seconds As Integer = 10
+    If Array.Count(args) > 3 Then seconds = Integer.Parse(args(3)).Or(10)
+    If seconds < 1 Or seconds > 3600 Then Throw New InvalidArgumentException("Seconds must be in 1..3600")
+    Dim port As Integer = 13854
+    If Array.Count(args) > 4 Then port = Integer.Parse(args(4)).Or(13854)
+    Dim state As New ThinkGearState()
+    Dim connection As New ThinkGearConnection(state)
+    Dim opened As Boolean = False
+    If mode = "serial" Then
+        opened = connection.OpenSerial(endpoint)
+    ElseIf mode = "tcp" Then
+        opened = connection.OpenTCP(endpoint, port)
+    ElseIf mode = "native" Then
+        opened = connection.OpenMindWave(endpoint)
+    ElseIf mode = "ble" Then
+        opened = connection.OpenBLE(endpoint)
+    Else
+        Throw New InvalidArgumentException("Unknown transport: " + mode)
+    End If
+    Dim started As Integer = System.Microseconds()
+    Dim lastReport As Integer = -1
+    Dim bytes As Integer = 0
+    Dim packets As Integer = 0
+    Try
+        While System.Microseconds() - started < seconds * 1000000
+            Dim nowSeconds As Double = (System.Microseconds() - started) / 1000000.0
+            bytes += connection.Poll(nowSeconds)
+            Dim received As Array Of ThinkGearPacket = connection.DrainPacketEvents()
+            packets += Array.Count(received)
+            Dim raw As Array Of Integer = connection.DrainRaw()
+            Dim discardedPackets As Array Of String = connection.DrainPackets()
+            Dim transport As String = connection.DrainTransportHex()
+            Dim elapsedWhole As Integer = Math.Floor(nowSeconds)
+            If elapsedWhole <> lastReport Then
+                lastReport = elapsedWhole
+                Dim report As JSONItem = JSONItem.NewObject()
+                report.Value("transport") = mode
+                report.Value("opened") = opened
+                report.Value("connected") = connection.IsOpen
+                report.Value("usable") = state.Usable(nowSeconds)
+                report.Value("simulated") = state.Simulated
+                report.Value("seconds") = nowSeconds
+                report.Value("bytes") = bytes
+                report.Value("packets") = packets
+                report.Value("rawSamples") = state.RawCount
+                report.Value("attention") = state.Attention
+                report.Value("meditation") = state.Meditation
+                report.Value("poorSignal") = state.PoorSignal
+                report.Value("error") = connection.LastError
+                Print report.ToString()
+            End If
+            Thread.Sleep(10)
+        End While
+    Finally
+        connection.Close()
+    End Try
+End Sub
