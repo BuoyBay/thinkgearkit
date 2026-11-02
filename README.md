@@ -1,4 +1,4 @@
-# ThinkGear decoder + MindWave serial/TCP/BLE
+# ThinkGear / MindWave
 
 Reusable native ThinkGear binary framing, Connector JSON decoding and sparse
 telemetry with independent contact/attention/meditation freshness. Import

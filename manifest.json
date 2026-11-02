@@ -2,7 +2,7 @@
   "schema": 1,
   "name": "thinkgearkit",
   "version": "0.1.0",
-  "description": "ThinkGear decoder + MindWave serial/TCP/BLE",
+  "description": "ThinkGear / MindWave",
   "libraries": [
     {
       "libName": "buoy_thinkgearkit",
