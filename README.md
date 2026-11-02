@@ -1,4 +1,4 @@
-# Decode ThinkGear data and connect to MindWave devices
+# ThinkGear decoder + MindWave serial/TCP/BLE
 
 Reusable native ThinkGear binary framing, Connector JSON decoding and sparse
 telemetry with independent contact/attention/meditation freshness. Import
