@@ -38,8 +38,7 @@ selection when names are unavailable or candidates are ambiguous.
 
 Serial enumeration inspects at most 16384 entries per inventory directory on
 Linux or present Ports inventory on Windows. macOS inspects at most 4096 paired
-objects. Linux/macOS fixture injection exists only in tests; the production
-entry point takes no arbitrary filesystem input. Platform compiler checks do
+objects. Production enumeration reads native inventories. Platform compiler checks do
 not establish Bluetooth hardware behavior.
 
 Verification commands:
@@ -54,5 +53,3 @@ macOS without a radio operation. `discovery_inventory.c` calls the public ABI
 for native platform inventory checks. Linux, macOS ARM64, and Windows x64 each
 executed a successful empty real inventory in this workspace. Named physical
 MindWave devices and multi-radio inventories remain unverified.
-
-Test suites and fixtures are maintainer-local and are not part of this public repository.

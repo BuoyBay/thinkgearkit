@@ -4,7 +4,7 @@
 IOBluetooth API. It selects an already paired device by exact address/name;
 empty, `auto`, and default `MindWave` selectors select the first paired device
 whose name begins with MindWave (case insensitive), sorted by address. Pairing remains an OS operation. This code does not use
-ThinkGear Connector, a vendor SDK, `/dev/cu.*`, or the sibling Rust application.
+ThinkGear Connector, a vendor SDK, or `/dev/cu.*`.
 
 Call every entry point from the macOS main thread and poll regularly. Open starts
 an asynchronous service query; status/read pump the default run loop, discover
@@ -33,17 +33,8 @@ Compile the library with ARC and Foundation, IOBluetooth and CoreFoundation:
 clang -fobjc-arc -Wall -Wextra -Werror -dynamiclib macos.m \
   -framework Foundation -framework IOBluetooth -framework CoreFoundation \
   -o libbuoy_thinkgear.dylib
-clang -fobjc-arc -Wall -Wextra -Werror macos_test.m \
-  -framework Foundation -framework IOBluetooth -framework CoreFoundation \
-  -o macos-test
-./macos-test
 ```
 
-On 2026-10-31 these commands passed natively on the available `m4-vi` lab,
-macOS 27.0.1 ARM64, Apple clang 21.0.0. Tests exercise invalid handles, main-thread
-rejection, synthetic delegate bytes including NUL/high bytes, partial queue
-compaction, connected state, stream timeout, queue overflow, open timeout and
-cleanup. Tests make no Bluetooth radio calls. This is native SDK/ABI and synthetic
-state evidence; no physical headset streaming or Bluetooth authorization UI was
-exercised. The source port draws on `../mind-games/src/macos.rs`; that project's
-hardware results do not establish hardware verification for this implementation.
+Native SDK compilation and synthetic state handling have been exercised on
+macOS ARM64. Physical headset streaming and Bluetooth authorization UI remain
+unverified for this backend.

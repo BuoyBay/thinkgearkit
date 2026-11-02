@@ -23,10 +23,8 @@ Poll retries open/disconnect failures after two seconds and restarts open stream
 silent for eight seconds. Set `AutoReconnect=False` to supply another policy.
 `Close` cancels retries; no failure substitutes simulated values. Serial Bluetooth pairing/binding is an OS operation.
 
-Maintainers run the private validation suite before release. See the repository README for public build instructions.
-
-Linux and macOS ARM64 passed native PTY/TCP tests; direct macOS RFCOMM/BLE
-passed real SDK builds and synthetic delegate fixtures without radio access.
+Linux and macOS ARM64 PTY/TCP backends have native coverage. macOS RFCOMM/BLE
+bridges have SDK and synthetic-callback coverage without radio access.
 Windows x64 native bridge cross-compiles; Windows execution is unverified.
 See `native/transport-validation.json`, `native/MACOS.md` and `native/BLE-README.md`. Hardware radio
 streaming remains unverified for this Buoy implementation; do not infer hardware
@@ -82,8 +80,6 @@ raw rows and mixed-contact batches rather than collapsing them to the sibling
 Rust parser's single final raw sample per packet. Malformed binary packets retain
 complete prefix row metadata but never apply partial telemetry updates.
 
-Maintainers run the private validation suite before release. See the repository README for public build instructions.
-
 Failure and close recording semantics: native BLE failure reports failed status
 immediately while previously accepted normalized records remain readable until
 exhausted. Explicit `Close` performs a bounded 256 KiB final read and retains
@@ -115,5 +111,3 @@ Unnamed `/dev/rfcomm0` or generic COM ports need manual selection. Missing/error
 inventory and bounded/partial inventory remain distinct from successful emptiness;
 BLE radio discovery is not part of this API. macOS calls belong on the main
 thread. See `native/DISCOVERY.md` for bounds, identity and OS mapping details.
-
-Maintainers run the private validation suite before release. See the repository README for public build instructions.

@@ -1,8 +1,7 @@
 # MindWave Mobile 2 BLE
 
 `ble.m` directly uses Apple's CoreBluetooth framework. It is a newly written
-Objective-C implementation of the profile facts documented by the sibling
-`mind-games/src/ble_protocol.rs` and `mind-games/docs/reference/mindwave-ble.md`.
+Objective-C implementation of the MindWave Mobile 2 BLE profile.
 It links no NeuroSky SDK and starts no helper process.
 
 The full service UUID is `039afff0-2c94-11e3-9e06-0002a5d5c51b`.
@@ -86,21 +85,6 @@ The exact payload byte field itself is never truncated.
 This bridge currently does not expose battery, scan-list UI, auto reconnection,
 or platform backends beyond macOS.
 
-Actual validation in this workspace: source compiled on macOS ARM64 `m4-vi`
-with `clang -std=c11 -O2 -Wall -Wextra -Werror`, and `ble_test.m` executed on
-that host. The tests instantiate fixture objects without a central manager,
-exercise stream command envelopes/checksums, raw signs/batch lengths, eSense limits,
-sparse powers and queue bounds,
-and never scan/connect/request authorization. Hardware BLE streaming, system
-permission behavior, radio loss and other architectures remain unverified for
-this implementation. The sibling Rust driver's physical-headset results do not
-establish hardware validation of this port.
-
-To rerun native fixtures on macOS from this directory:
-
-```sh
-clang -std=c11 -O2 -Wall -Wextra -Werror ble_test.m \
-  -framework Foundation -framework CoreBluetooth -framework CoreFoundation \
-  -o /tmp/thinkgear-ble-test
-/tmp/thinkgear-ble-test
-```
+Native SDK compilation and synthetic callback handling have been exercised on
+macOS ARM64. Physical headset streaming, Bluetooth authorization UI, radio loss
+and other architectures remain unverified for this implementation.

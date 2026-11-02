@@ -1,6 +1,6 @@
 # Decode ThinkGear data and connect to MindWave devices
 
-Reusable native Buoy ThinkGear binary framing, Connector JSON decoding and sparse
+Reusable native ThinkGear binary framing, Connector JSON decoding and sparse
 telemetry with independent contact/attention/meditation freshness. Import
 `thinkgearkit`. Scores remain in the headset's 0..100 range; zero on hardware is
 unavailable. Gameplay requires connected input, fresh good contact and the
@@ -45,8 +45,6 @@ On your own machine, install Buoy and run:
 ```sh
 buoy ai init --both
 ```
-
-The generated agent files and editor settings stay local and are ignored by Git.
 
 ## Contributing
 
